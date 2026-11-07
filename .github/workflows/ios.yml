@@ -1,0 +1,82 @@
+name: iOS build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # The debugger helper targets iOS 26, so the toolchain has to be Xcode 26 or later.
+    runs-on: macos-26
+    timeout-minutes: 150
+    env:
+      HUSK: ${{ github.workspace }}/Husk
+      IOS_DEPS: ${{ github.workspace }}/Husk/build/ios-arm64/sysroot
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          brew install xcodegen meson ninja cmake
+          rustup target add aarch64-apple-ios
+
+      # Husk supplies what Henge links but does not vendor: StikJIT, the pairing
+      # library, libslirp and glib (arm64 iOS). Building it takes a while, so it is
+      # cached by the runner image, not by Henge's commits.
+      - name: Cache Husk's iOS pieces
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.HUSK }}/build/ios-arm64
+          key: husk-ios-arm64-${{ runner.os }}-${{ hashFiles('.github/workflows/ios.yml') }}-v1
+
+      - name: Get Husk's iOS pieces
+        run: |
+          git clone --depth 1 https://github.com/Leviidev/Husk.git "$HUSK"
+          cd "$HUSK"
+          if [ ! -f build/ios-arm64/sysroot/lib/libglib-2.0.a ]; then
+            ./scripts/fetch_sources.sh
+            ./scripts/build_ios.sh libffi glib pixman libucontext libslirp
+          fi
+          if [ ! -f build/ios-arm64/lib/libhusk_rppairing.a ]; then
+            ./scripts/build_rppairing_ios.sh
+          fi
+
+      - name: Henge's copy of those pieces
+        run: ios/scripts/fetch_deps.sh
+
+      - name: Engine and the Mac helper
+        run: make ios-lib build/henge-agent.gz
+
+      - name: The restore stack
+        run: ./tools/build_ios_restore.sh
+
+      - name: Xcode project
+        run: cd ios && xcodegen generate
+
+      - name: Build the app
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project ios/Henge.xcodeproj \
+            -scheme Henge \
+            -configuration Debug \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            build 2>&1 | tee xcodebuild.log | tail -80
+
+      - name: Keep the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: xcodebuild.log
+          if-no-files-found: ignore

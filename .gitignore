@@ -1,0 +1,4 @@
+build/
+ios/deps/
+ios/Henge.xcodeproj/
+.DS_Store
