@@ -255,7 +255,9 @@ final class Installer: NSObject, ObservableObject {
         cfg.timeoutIntervalForResource = 48 * 3600
         let s = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
         session = s
-        return try await withCheckedThrowingContinuation { (c: CheckedContinuation<URL, Error>) in
+        // The continuation's value is the part file's URL; `download` already knows it,
+        // and this function's job is only to wait for the transfer to finish.
+        _ = try await withCheckedThrowingContinuation { (c: CheckedContinuation<URL, Error>) in
             downloadContinuation = c
             s.dataTask(with: request).resume()
         }
