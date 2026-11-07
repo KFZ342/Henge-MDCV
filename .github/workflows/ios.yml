@@ -96,6 +96,29 @@ jobs:
             xcodebuild.log | head -14 | sed 's/^\s*/::error::/' || true
           exit $rc
 
+      - name: Package an unsigned IPA
+        if: success()
+        run: |
+          set -e
+          APP=$(find build/DerivedData/Build/Products -maxdepth 2 -name "Henge.app" -type d | head -1)
+          echo "app: $APP"
+          test -d "$APP"
+          rm -rf build/Payload build/Henge-MDCV-unsigned.ipa
+          mkdir -p build/Payload
+          ditto "$APP" "build/Payload/$(basename "$APP")"
+          cd build
+          # ditto keeps the bundle's symlinks and extended attributes a zip rewrite would lose.
+          ditto -c -k --sequesterRsrc --keepParent Payload Henge-MDCV-unsigned.ipa
+          ls -lh Henge-MDCV-unsigned.ipa
+
+      - name: Keep the IPA
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Henge-MDCV-unsigned-ipa
+          path: build/Henge-MDCV-unsigned.ipa
+          if-no-files-found: error
+
       - name: Keep the log
         if: always()
         uses: actions/upload-artifact@v4
