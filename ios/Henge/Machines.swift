@@ -145,9 +145,38 @@ final class Machines: ObservableObject {
                 continue
             }
             guard let id = UUID(uuidString: item.lastPathComponent), !known.contains(id) else { continue }
+            if takeOver(item, id: id, on: root) { continue }
             HengeLog.log("machines", "removing the unfinished machine \(id)")
             try? FileManager.default.removeItem(at: item)
         }
+        // A restore whose cleanup could not run — the drive was pulled as it finished — leaves
+        // its scratch folder inside a machine folder that is legitimately in the list, so the
+        // loop above leaves it alone. It is tens of gigabytes of no use to anyone.
+        for mac in all where MacRun.current != mac.id {
+            guard mac.directory.deletingLastPathComponent().standardizedFileURL.path == root.standardizedFileURL.path else { continue }
+            let leftovers = mac.directory.appendingPathComponent("restore", isDirectory: true)
+            guard FileManager.default.fileExists(atPath: leftovers.path) else { continue }
+            HengeLog.log("machines", "removing the restore leftovers of \(mac.name)")
+            try? FileManager.default.removeItem(at: leftovers)
+        }
+    }
+
+    /// A Mac whose restore ran to the end but never reached the list — the app died between
+    /// the two, or the drive was pulled as it finished. Its `installed` marker says the work
+    /// was done, so it is taken over here instead of being deleted with the debris.
+    private func takeOver(_ folder: URL, id: UUID, on root: URL) -> Bool {
+        guard FileManager.default.fileExists(atPath: folder.appendingPathComponent("installed").path),
+              let data = try? Data(contentsOf: folder.appendingPathComponent("machine.json")),
+              let info = try? JSONDecoder().decode(MachineFile.self, from: data) else { return false }
+        var mac = VirtualMac(name: info.name ?? "Recovered Mac", ecid: info.ecid, seed: info.seed ?? 0,
+                             ramMB: info.ramMB ?? 2048, diskBytes: 0)
+        mac.id = id
+        mac.cpus = info.cpus
+        if root.standardizedFileURL.path != Self.root.standardizedFileURL.path { mac.external = true }
+        all.append(mac)
+        save()
+        HengeLog.log("machines", "took over \(mac.name), which finished installing but was never listed")
+        return true
     }
 
     nonisolated static var root: URL {
@@ -173,6 +202,12 @@ final class Machines: ObservableObject {
 
     /// A folder chosen in the Files picker: copied (it may be on another volume).
     func importFolder(_ folder: URL) {
+        // An install is writing tens of gigabytes to the same storage: doing both at once
+        // races them for room and leaves whichever finishes second to fail.
+        guard !Installer.shared.busy else {
+            lastError = "Wait for the install to finish before bringing in a Mac."
+            return
+        }
         Task {
             let scoped = folder.startAccessingSecurityScopedResource()
             defer { if scoped { folder.stopAccessingSecurityScopedResource() } }
@@ -310,6 +345,11 @@ final class Machines: ObservableObject {
         // out from under the engine, on the drive or off it.
         guard MacRun.current != mac.id else {
             lastError = "Shut down \(mac.name) before moving it."
+            return
+        }
+        // The restore is writing to the same storage; a move beside it races for room.
+        guard !Installer.shared.busy else {
+            lastError = "Wait for the install to finish before moving \(mac.name)."
             return
         }
         // Moving off a drive that is not in would "move" a folder that does not exist.

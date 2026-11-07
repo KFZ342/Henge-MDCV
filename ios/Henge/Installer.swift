@@ -56,6 +56,8 @@ final class Installer: NSObject, ObservableObject {
     nonisolated(unsafe) private var partTotal: Int64 = 0
     nonisolated(unsafe) private var partAt: Int64 = 0
     nonisolated(unsafe) private var partProgressAt: Double = 0
+    /// The size the release lists, so a part file can be told from a whole image.
+    nonisolated(unsafe) private var partBytes: Int64 = 0
 
     var busy: Bool {
         switch phase {
@@ -72,10 +74,14 @@ final class Installer: NSObject, ObservableObject {
     nonisolated static func imagePath(_ r: MacOSRelease) -> URL { imageDirectory.appendingPathComponent("\(r.id).ipsw") }
 
     /// The size of the image on this iPhone, if a whole one is there (the listed sizes are rounded).
-    static func imageSize(_ r: MacOSRelease) -> Int64? {
-        let values = try? imagePath(r).resourceValues(forKeys: [.fileSizeKey])
-        guard let size = values?.fileSize, Int64(size) > r.bytes / 2 else { return nil }
-        return Int64(size)
+    static func imageSize(_ r: MacOSRelease) -> Int64? { wholeSize(imagePath(r), of: r) }
+
+    /// The size of a file that is all of the image, or nil when it is short. Five percent
+    /// covers the rounding in the listed size; a copy cut short — a move onto a
+    /// drive that was pulled, say — is not whole, and must not be mistaken for one.
+    static func wholeSize(_ url: URL, of r: MacOSRelease) -> Int64? {
+        let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value ?? 0
+        return size > r.bytes / 20 * 19 ? size : nil
     }
 
     static func haveImage(_ r: MacOSRelease) -> Bool { imageSize(r) != nil }
@@ -100,11 +106,30 @@ final class Installer: NSObject, ObservableObject {
             phase = .failed("Henge runs one Mac per launch, and one has already run. Quit Henge (swipe it away), open it again, then install.")
             return
         }
+        // An import or a move is tens of gigabytes crossing the same storage the
+        // restore writes to; starting now would race it for space and time.
+        if let moving = Machines.shared.moving {
+            phase = .failed("Wait for \(moving) to finish moving before installing.")
+            return
+        }
+        if let importing = Machines.shared.importing {
+            phase = .failed("Wait for \(importing) to finish coming in before installing.")
+            return
+        }
         machineName = name
+        // Said before the download, not after it: the installer runs the Mac's own restore
+        // system, which needs JIT, and finding that out after 16 GB has arrived is too late.
+        guard JITBootstrap.ready else {
+            phase = .failed("Turn on JIT first: the installer runs the Mac's own restore system, which needs it.")
+            return
+        }
         UIApplication.shared.isIdleTimerDisabled = true // the screen locking would suspend the download and the restore
         Task {
             defer { UIApplication.shared.isIdleTimerDisabled = false }
-            var made: VirtualMac?
+            // The folder the machine is made in, fixed here: `mac.directory` is read from the
+            // live drive state, and a drive that goes away mid-install would send it to the
+            // empty local folder instead — a disk born on the drive, then looked for here.
+            var madeIn: URL?
             do {
                 // What an earlier restore that died left on the drive is not free space.
                 if let drive = ExternalStorage.shared.machinesRoot { Machines.shared.tidy(drive) }
@@ -113,21 +138,28 @@ final class Installer: NSObject, ObservableObject {
                 HengeLog.log("install", "boot ROM ready")
                 let ipsw = try await download(release)
                 phase = .preparing
-                var mac = try prepare(name: name, ramMB: ramMB, rom: rom, cpus: cpus)
-                mac.osName = release.name
-                made = mac
+                // The download can run for half an hour: the room it was checked against
+                // can be gone by now, and the Mac's 64 GB disk is made right after this.
+                try checkSpace(release, ramMB: ramMB)
+                let (mac, directory) = try prepare(name: name, ramMB: ramMB, rom: rom, cpus: cpus)
+                var made = mac
+                made.osName = release.name
+                madeIn = directory
                 phase = .installing
-                try await install(mac, ipsw: ipsw, cpus: cpus)
-                Machines.shared.add(mac)
-                if !keepImage { try? FileManager.default.removeItem(at: ipsw) }
+                try await install(made, directory: directory, ipsw: ipsw, cpus: cpus)
+                Machines.shared.add(made)
+                if !keepImage {
+                    do { try FileManager.default.removeItem(at: ipsw) }
+                    catch { HengeLog.log("install", "could not remove the image \(ipsw.lastPathComponent): \(error.localizedDescription)") }
+                }
                 HengeLog.log("install", "\(name): installed \(release.name)")
-                phase = .done("\(release.name) is installed on \(name)\(mac.external == true ? ", on the drive" : ""). Quit Henge (swipe it away) and open it again, then tap Start. Keep the drive connected whenever it runs.")
+                phase = .done("\(release.name) is installed on \(name)\(made.external == true ? ", on the drive" : ""). Quit Henge (swipe it away) and open it again, then tap Start. Keep the drive connected whenever it runs.")
             } catch {
                 HengeLog.log("install", "failed: \(error.localizedDescription)")
                 // A half-installed Mac is no use, and its disk can be many gigabytes. The download stays.
-                if let made, henge_vm_state() != 1 {
-                    do { try FileManager.default.removeItem(at: made.directory) }
-                    catch { HengeLog.log("install", "could not remove \(made.directory.path): \(error.localizedDescription)") }
+                if let madeIn, henge_vm_state() != 1 {
+                    do { try FileManager.default.removeItem(at: madeIn) }
+                    catch { HengeLog.log("install", "could not remove \(madeIn.path): \(error.localizedDescription)") }
                 }
                 phase = .failed(error.localizedDescription)
             }
@@ -146,17 +178,19 @@ final class Installer: NSObject, ObservableObject {
         if ExternalStorage.shared.enabled, ExternalStorage.shared.folder == nil {
             throw message("Plug in the drive before installing on it (or turn external storage off in Settings).")
         }
-        let here = (try? URL(fileURLWithPath: NSHomeDirectory()).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
-            .volumeAvailableCapacityForImportantUsage ?? 0
+        let here = freeSpace(URL(fileURLWithPath: NSHomeDirectory())) ?? 0
         if let drive = ExternalStorage.shared.folder {
             // The image, the new Mac's disk and the restore's scratch all go on
             // the drive; this device only holds the Mac's RAM while it installs.
-            let values = try? drive.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeSupportsSparseFilesKey, .volumeLocalizedFormatDescriptionKey])
-            let free = values?.volumeAvailableCapacityForImportantUsage ?? 0
+            let values = try? drive.resourceValues(forKeys: [.volumeSupportsSparseFilesKey, .volumeLocalizedFormatDescriptionKey])
+            let free = freeSpace(drive) ?? 0
             // A Mac's disk is one 64 GB file. FAT32 stops at 4 GB, so the restore would
             // fail hours in with a message about space; say what is actually wrong.
             let format = (values?.volumeLocalizedFormatDescription ?? "").uppercased()
-            if format.contains("FAT32") || format.contains("MS-DOS") {
+            // Any FAT variant stops at 4 GB a file; exFAT does not, and its name contains "FAT".
+            let fatFamily = format.contains("FAT32") || format.contains("MS-DOS")
+                || (format.contains("FAT") && !format.contains("EXFAT"))
+            if fatFamily {
                 throw message("This drive is formatted FAT32, and a Mac's 64 GB disk cannot live on it (that format stops at 4 GB a file). Reformat the drive as exFAT or APFS in Files or on a Mac, then try again.")
             }
             // A drive that cannot keep holes pays for the whole 64 GB disk up front.
@@ -176,6 +210,18 @@ final class Installer: NSObject, ObservableObject {
         }
     }
 
+    /// Free space that can actually be used, or nil when the volume will not say.
+    /// The "important usage" figure is the one purgeable space counts towards, and some
+    /// volumes answer 0 for it; the plain figure is then the fallback, since skipping the
+    /// check altogether would be worse than a slightly conservative one.
+    private func freeSpace(_ url: URL) -> Int64? {
+        let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey,
+                                                       .volumeAvailableCapacityKey])
+        if let important = values?.volumeAvailableCapacityForImportantUsage, important > 0 { return Int64(important) }
+        if let plain = values?.volumeAvailableCapacity, plain > 0 { return Int64(plain) }
+        return nil
+    }
+
     // MARK: Download
 
     /// Streams the image to wherever it belongs, chunk by chunk. URLSession's
@@ -189,9 +235,15 @@ final class Installer: NSObject, ObservableObject {
         let dir = Self.imageDirectory
         let dest = dir.appendingPathComponent("\(r.id).ipsw")
         let onDrive = ExternalStorage.shared.folder != nil
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        do { try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }
+        catch {
+            // Usually the drive going away between the check and here: say that, not a Cocoa error.
+            throw message(onDrive
+                ? "The drive went away before the download could start. Plug it back in and install again."
+                : "Cannot make the download folder here: \(error.localizedDescription).")
+        }
         Machines.excludeFromBackup(dir)
-        if Self.haveImage(r) {
+        if Self.wholeSize(dest, of: r) != nil {
             HengeLog.log("install", "using the downloaded \(r.name)")
             return dest
         }
@@ -199,11 +251,13 @@ final class Installer: NSObject, ObservableObject {
             // A copy already on this device (from before the drive was picked) saves
             // the download: moving 16 GB across the volumes beats fetching it again.
             let inside = Machines.root.appendingPathComponent("Restore images", isDirectory: true).appendingPathComponent("\(r.id).ipsw")
-            let size = (try? FileManager.default.attributesOfItem(atPath: inside.path)[.size] as? Int64) ?? 0
-            if size > r.bytes / 2 {
+            if Self.wholeSize(inside, of: r) != nil {
                 HengeLog.log("install", "moving the downloaded \(r.name) onto the drive")
                 try? FileManager.default.moveItem(at: inside, to: dest)
-                if Self.haveImage(r) { return dest }
+                if Self.wholeSize(dest, of: r) != nil { return dest }
+                // The copy stopped short (the drive filled or was pulled): its half file would
+                // otherwise sit beside the download and take the room the download needs.
+                try? FileManager.default.removeItem(at: dest)
             }
         }
         phase = .downloading
@@ -212,7 +266,7 @@ final class Installer: NSObject, ObservableObject {
         HengeLog.log("install", "downloading \(r.url.absoluteString)")
         for attempt in 1...40 {
             do {
-                try await stream(r.url, to: dest.appendingPathExtension("part"))
+                try await stream(r.url, to: dest.appendingPathExtension("part"), expected: r.bytes)
                 return dest
             } catch {
                 discardSession()
@@ -225,12 +279,15 @@ final class Installer: NSObject, ObservableObject {
                 // anything else (Apple's server answering oddly) will not improve.
                 let ns = error as NSError
                 let retryable = error is URLError || (ns.domain == "Henge" && ns.code == 4)
-                if !away, !retryable { throw error }
+                // A drive pulled out can write-fail before the watch notices it is gone, so a
+                // file error on a drive counts as "wait for it" too, not as a lost download.
+                let driveTrouble = onDrive && (ns.domain == NSCocoaErrorDomain || ns.domain == NSPOSIXErrorDomain)
+                if !away, !retryable, !driveTrouble { throw error }
                 if attempt >= 40 { throw message("The download kept failing.") }
                 HengeLog.log("install", "download interrupted (\(error.localizedDescription)); resuming")
                 // While the drive is away, wait for it (plugging it back in resumes
                 // where the download stopped, from the part file on it).
-                try await Task.sleep(nanoseconds: away ? 8_000_000_000 : 3_000_000_000)
+                try await Task.sleep(nanoseconds: (away || driveTrouble) ? 8_000_000_000 : 3_000_000_000)
             }
         }
         throw message("The download kept failing.")
@@ -238,17 +295,25 @@ final class Installer: NSObject, ObservableObject {
 
     /// Streams from `url` into a part file beside the image, resuming at
     /// whatever of it is already there (Apple's CDN honors ranges).
-    private func stream(_ url: URL, to part: URL) async throws {
+    private func stream(_ url: URL, to part: URL, expected: Int64) async throws {
+        // A handle left by the attempt that just failed still points into the part file;
+        // close it so this attempt opens its own and appends at the file's real end.
+        try? partHandle?.close()
+        partHandle = nil
         var start: Int64 = 0
         if let attrs = try? FileManager.default.attributesOfItem(atPath: part.path),
            let size = attrs[.size] as? NSNumber { start = size.int64Value }
         var request = URLRequest(url: url)
         if start > 0 { request.setValue("bytes=\(start)-", forHTTPHeaderField: "Range") }
+        // A resumed download starts where the part file ends, and the bar says so.
+        received = start
+        self.expected = expected
         partURL = part
         partStart = start
         partAt = start
         partTotal = 0     // the size of a different image must not leak into this one
         partProgressAt = 0
+        partBytes = expected
         discardSession() // an earlier attempt's session, its task long finished
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 120
@@ -290,7 +355,11 @@ final class Installer: NSObject, ObservableObject {
 
     // MARK: The new machine
 
-    private func prepare(name: String, ramMB: Int, rom: URL, cpus: Int) throws -> VirtualMac {
+    /// Makes the new Mac's folder and files. Returns both the Mac and the folder it was
+    /// actually made in: the folder is fixed here rather than read back from `mac.directory`,
+    /// which follows the live drive and would move to this device's empty folder if the
+    /// drive went away halfway through.
+    private func prepare(name: String, ramMB: Int, rom: URL, cpus: Int) throws -> (VirtualMac, URL) {
         // A new machine identity, as VZMacMachineIdentifier makes one: a random ECID.
         let ecid = UInt64.random(in: 1 << 40 ..< 1 << 62)
         var mac = VirtualMac(name: name, ecid: ecid, seed: 0, ramMB: ramMB, diskBytes: 64 << 30)
@@ -298,68 +367,116 @@ final class Installer: NSObject, ObservableObject {
         mac.cpus = cpus
         // With a drive on, the machine is made there: its disk, auxiliary
         // storage and ROM live on it, and it runs from it.
-        if ExternalStorage.shared.folder != nil { mac.external = true }
+        let drive = ExternalStorage.shared.folder
+        if drive != nil { mac.external = true }
         let fm = FileManager.default
-        let place = mac.external == true ? "on the drive" : "here"
-        do { try fm.createDirectory(at: mac.directory, withIntermediateDirectories: true) }
+        let place = drive != nil ? "on the drive" : "here"
+        let base = drive.map { $0.appendingPathComponent("Machines", isDirectory: true) } ?? Machines.root
+        let directory = base.appendingPathComponent(mac.id.uuidString, isDirectory: true)
+        let romAt = directory.appendingPathComponent("AVPBooter.vmapple2.bin")
+        let diskAt = directory.appendingPathComponent("disk.img")
+        let auxAt = directory.appendingPathComponent("auxiliary.bin")
+        do { try fm.createDirectory(at: directory, withIntermediateDirectories: true) }
         catch { throw message("Cannot make the Mac's folder \(place): \(error.localizedDescription).") }
-        Machines.excludeFromBackup(Machines.root)
-        try? fm.removeItem(at: mac.rom)
-        try fm.copyItem(at: rom, to: mac.rom)
-        guard fm.createFile(atPath: mac.disk.path, contents: nil) else {
+        if drive == nil { Machines.excludeFromBackup(Machines.root) } // a drive is not in a backup
+        try? fm.removeItem(at: romAt)
+        try fm.copyItem(at: rom, to: romAt)
+        guard fm.createFile(atPath: diskAt.path, contents: nil) else {
             throw message("Cannot create the 64 GB disk \(place): there may not be enough room.")
         }
-        let h = try FileHandle(forWritingTo: mac.disk)
-        try h.truncate(atOffset: UInt64(64) << 30) // sparse: blocks are only used as macOS writes them
-        try h.close()
-        guard henge_make_aux(mac.aux.path) == 0 else { throw message("Cannot create the auxiliary storage.") }
+        let h = try FileHandle(forWritingTo: diskAt)
+        do {
+            // Sparse: blocks are only used as macOS writes them. A drive that cannot keep
+            // holes pays for all 64 GB here, which is what the space check counted.
+            try h.truncate(atOffset: UInt64(64) << 30)
+        } catch {
+            try? h.close()
+            throw message("Cannot make the 64 GB disk \(place): \(error.localizedDescription).")
+        }
+        try? h.close()
+        guard henge_make_aux(auxAt.path) == 0 else { throw message("Cannot create the auxiliary storage \(place).") }
         let info: [String: Any] = ["name": name, "ecid": ecid, "seed": 0, "ramMB": ramMB, "cpus": cpus]
-        try JSONSerialization.data(withJSONObject: info).write(to: mac.directory.appendingPathComponent("machine.json"))
+        do { try JSONSerialization.data(withJSONObject: info).write(to: directory.appendingPathComponent("machine.json"), options: .atomic) }
+        catch { throw message("Cannot write the Mac's details \(place): \(error.localizedDescription).") }
         mac.diskBytes = 64 << 30
-        HengeLog.log("install", "new machine \(name): ECID \(ecid), 64 GB disk")
-        return mac
+        HengeLog.log("install", "new machine \(name): ECID \(ecid), 64 GB disk \(place)")
+        return (mac, directory)
     }
 
     // MARK: The restore
 
-    private func install(_ mac: VirtualMac, ipsw: URL, cpus: Int) async throws {
+    private func install(_ mac: VirtualMac, directory: URL, ipsw: URL, cpus: Int) async throws {
         guard JITBootstrap.ready else { throw message("Turn on JIT first: the installer runs the Mac's own restore system, which needs it.") }
         let ram = GuestMemory.prepare(mac)
         guard ram >= 2048 else { throw message("Installing needs a few more GB of free storage for the Mac's memory.") }
-        let work = mac.directory.appendingPathComponent("restore", isDirectory: true)
-        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        let romAt = directory.appendingPathComponent("AVPBooter.vmapple2.bin")
+        let diskAt = directory.appendingPathComponent("disk.img")
+        let auxAt = directory.appendingPathComponent("auxiliary.bin")
+        let work = directory.appendingPathComponent("restore", isDirectory: true)
+        do { try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true) }
+        catch {
+            throw message("Cannot make the restore's working folder \(mac.external == true ? "on the drive" : "here"): \(error.localizedDescription).")
+        }
+        // The image was saved where the drive was at the start of the download; if the drive
+        // went and came back as another one, that path is not this Mac's drive any more.
+        guard FileManager.default.fileExists(atPath: ipsw.path) else {
+            throw message("The downloaded image is no longer at \(ipsw.path). Plug the same drive back in and install again: the download is kept.")
+        }
+        guard FileManager.default.fileExists(atPath: romAt.path), FileManager.default.fileExists(atPath: diskAt.path) else {
+            throw message("The Mac's files are gone \(mac.external == true ? "from the drive: it was disconnected" : "from this \(Device.name)"). Plug the drive back in and install again.")
+        }
         var buffer = [CChar](repeating: 0, count: 256)
-        let rc = henge_vm_install(mac.rom.path, mac.disk.path, mac.aux.path, mac.ecid, ipsw.path, work.path, ram, Int32(cpus),
+        let rc = henge_vm_install(romAt.path, diskAt.path, auxAt.path, mac.ecid, ipsw.path, work.path, ram, Int32(cpus),
                                   &buffer, buffer.count)
-        if rc != 0 { throw message(String(cString: buffer)) }
-        while true {
-            try await Task.sleep(nanoseconds: 1_000_000_000)
-            // A Mac on the drive cannot be restored with the drive gone. Stop it here, where
-            // the reason can be said plainly, rather than let the engine write into nothing.
-            if mac.external == true, ExternalStorage.shared.folder == nil {
-                if henge_vm_state() == 1 { henge_vm_stop() }
-                throw message("The drive was disconnected while macOS was being written to it. Plug it back in and install again: the download is kept.")
+        if rc != 0 {
+            if henge_vm_state() == 1 { henge_vm_stop() }
+            throw message(String(cString: buffer))
+        }
+        do {
+            while true {
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+                // A Mac on the drive cannot be restored with the drive gone. Stop it here, where
+                // the reason can be said plainly, rather than let the engine write into nothing.
+                if mac.external == true, ExternalStorage.shared.folder == nil {
+                    if henge_vm_state() == 1 { henge_vm_stop() }
+                    throw message("The drive was disconnected while macOS was being written to it. Plug it back in, quit Henge and open it again, then install: the download is kept.")
+                }
+                // The last seconds of a restore need somewhere to write; a drive with no room
+                // fails deep in the engine, with its own words rather than the plain one.
+                if mac.external == true, let free = ExternalStorage.shared.freeBytes, free > 0, free < (1 << 30) {
+                    if henge_vm_state() == 1 { henge_vm_stop() }
+                    throw message("The drive has only \(ByteText.string(UInt64(free))) left and the restore cannot finish. Make room on the drive, quit Henge, open it again, then install.")
+                }
+                step = Int(henge_install_step())
+                stepProgress = henge_install_progress()
+                if step == 100 {
+                    // Marked before the Mac is added to the list: if the app dies in between,
+                    // a finished 64 GB Mac must not look like the debris tidy() removes.
+                    _ = FileManager.default.createFile(atPath: directory.appendingPathComponent("installed").path, contents: nil)
+                    break
+                }
+                // Never launched, or ended without a word: nothing is going to advance now.
+                if henge_vm_state() == 0 {
+                    throw message("The installer stopped before it started (\(String(cString: henge_vm_exit_reason()))). Quit Henge, open it again, then install.")
+                }
+                if step == 101 { throw message("The restore failed. The log (Settings, or Documents/henge.log) says why. Quit Henge, open it again, then try another release.") }
+                if henge_vm_state() == 2 && step < 100 {
+                    // The restore ends with the machine restarting, and idevicerestore finishes a
+                    // little after; a stop with no result after that is a failure.
+                    for _ in 0..<90 where henge_install_step() < 100 { try await Task.sleep(nanoseconds: 1_000_000_000) }
+                    if henge_install_step() == 100 { break }
+                    throw message("The machine stopped during the restore (\(String(cString: henge_vm_exit_reason()))).")
+                }
             }
-            // The last seconds of a restore need somewhere to write; a drive with no room
-            // fails deep in the engine, with its own words rather than the plain one.
-            if mac.external == true, let free = ExternalStorage.shared.freeBytes, free > 0, free < (1 << 30) {
-                if henge_vm_state() == 1 { henge_vm_stop() }
-                throw message("The drive has only \(ByteText.string(UInt64(free))) left and the restore cannot finish. Make room on the drive, then install again.")
-            }
-            step = Int(henge_install_step())
-            stepProgress = henge_install_progress()
-            if step == 100 { break }
-            if step == 101 { throw message("The restore failed. The log (Settings, or Documents/henge.log) says why.") }
-            if henge_vm_state() == 2 && step < 100 {
-                // The restore ends with the machine restarting, and idevicerestore finishes a
-                // little after; a stop with no result after that is a failure.
-                for _ in 0..<90 where henge_install_step() < 100 { try await Task.sleep(nanoseconds: 1_000_000_000) }
-                if henge_install_step() == 100 { break }
-                throw message("The machine stopped during the restore (\(String(cString: henge_vm_exit_reason()))).")
-            }
+        } catch {
+            // Whatever ended the restore — a failure step, a cancelled task, a thrown message —
+            // the engine must not be left holding the Mac's disk in memory.
+            if henge_vm_state() == 1 { henge_vm_stop() }
+            throw error
         }
         if henge_vm_state() == 1 { henge_vm_stop() }
-        try? FileManager.default.removeItem(at: work)
+        do { try FileManager.default.removeItem(at: work) }
+        catch { HengeLog.log("install", "could not remove \(work.path): \(error.localizedDescription)") }
     }
 
     static func stepName(_ step: Int) -> String {
@@ -392,10 +509,17 @@ extension Installer: URLSessionDataDelegate {
             return
         }
         // 416 with a range means the part file is already whole (a crash between
-        // the end and the move): call it done.
+        // the end and the move): call it done — but only if it really is whole,
+        // since a part that stopped short gets the same answer.
         if status == 416, partStart > 0, let part = partURL {
             try? partHandle?.close()
             partHandle = nil
+            guard partStart > partBytes / 20 * 19 else {
+                try? FileManager.default.removeItem(at: part) // start over from nothing
+                fail(NSError(domain: "Henge", code: 4, userInfo: [NSLocalizedDescriptionKey: "The download ended early."]))
+                completionHandler(.cancel)
+                return
+            }
             let dest = part.deletingPathExtension()
             do {
                 try? FileManager.default.removeItem(at: dest)
@@ -460,7 +584,8 @@ extension Installer: URLSessionDataDelegate {
         let total = partTotal
         partHandle = nil
         partURL = nil
-        guard let handle, let part, at > 0, total <= 0 || at == total else {
+        let complete = at > 0 && (total > 0 ? at == total : at > partBytes / 20 * 19)
+        guard let handle, let part, complete else {
             try? handle?.close()
             fail(NSError(domain: "Henge", code: 4, userInfo: [NSLocalizedDescriptionKey: "The download ended early."]))
             return
