@@ -65,8 +65,13 @@ struct HomeView: View {
             .fileImporter(isPresented: $picking, allowedContentTypes: [.folder]) { result in
                 if case let .success(url) = result { machines.importFolder(url) }
             }
-            .fileImporter(isPresented: $pickingDrive, allowedContentTypes: [.folder]) { result in
-                if case let .success(url) = result { external.choose(url) }
+            .sheet(isPresented: $pickingDrive) {
+                // Not fileImporter: it copies, and a folder cannot be copied, so the
+                // picker greyed every folder out and only files looked selectable.
+                FolderPicker { url in
+                    pickingDrive = false
+                    external.choose(url)
+                }
             }
             .task {
                 while !Task.isCancelled { // the region may be claimed after a hand-off to StikDebug
