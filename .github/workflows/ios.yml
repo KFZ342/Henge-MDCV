@@ -75,8 +75,11 @@ jobs:
           PY
 
       - name: Build the app
+        shell: bash
         run: |
-          set -o pipefail
+          # GitHub runs this script with -e: catch the failure instead of exiting on it,
+          # so the reasons below still get printed.
+          set +e
           xcodebuild \
             -project ios/Henge.xcodeproj \
             -scheme Henge \
@@ -86,10 +89,11 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             build > xcodebuild.log 2>&1
           rc=$?
+          set -e
           tail -40 xcodebuild.log || true
           # The reasons, where they can be read without signing in to GitHub.
-          grep -E "error: |Undefined symbol|not found for architecture|does not contain|BUILD FAILED|scheme .* not found" xcodebuild.log \
-            | head -12 | sed 's/^ */::error::/' || true
+          grep -E "error:|Undefined symbols|not found for architecture|Unable to find|BUILD FAILED|does not contain" \
+            xcodebuild.log | head -14 | sed 's/^\s*/::error::/' || true
           exit $rc
 
       - name: Keep the log
