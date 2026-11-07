@@ -12,8 +12,9 @@ concurrency:
 
 jobs:
   build:
-    # The debugger helper targets iOS 26, so the toolchain has to be Xcode 26 or later.
-    runs-on: macos-26
+    # The app uses iOS 27's external-display API and the helper targets iOS 26,
+    # so the image must carry Xcode 27 (a preview image on GitHub's side).
+    runs-on: xcode-27
     timeout-minutes: 150
     env:
       HUSK: ${{ github.workspace }}/Husk
@@ -61,6 +62,18 @@ jobs:
       - name: Xcode project
         run: cd ios && xcodegen generate
 
+      # If the shared scheme is missing, xcodebuild says so in one line. Put that
+      # (and the scheme list) in an annotation: the step log needs a sign-in.
+      - name: What Xcode sees
+        run: |
+          xcodebuild -project ios/Henge.xcodeproj -list -json > /tmp/list.json 2>/tmp/list.err || true
+          python3 - <<'PY' || cat /tmp/list.err | sed 's/^/::error::/'
+          import json
+          d = json.load(open('/tmp/list.json'))['project']
+          print("::notice::schemes: " + ", ".join(d.get('schemes', [])))
+          print("::notice::targets: " + ", ".join(d.get('targets', [])))
+          PY
+
       - name: Build the app
         run: |
           set -o pipefail
@@ -71,7 +84,13 @@ jobs:
             -destination 'generic/platform=iOS' \
             -derivedDataPath build/DerivedData \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
-            build 2>&1 | tee xcodebuild.log | tail -80
+            build > xcodebuild.log 2>&1
+          rc=$?
+          tail -40 xcodebuild.log || true
+          # The reasons, where they can be read without signing in to GitHub.
+          grep -E "error: |Undefined symbol|not found for architecture|does not contain|BUILD FAILED|scheme .* not found" xcodebuild.log \
+            | head -12 | sed 's/^ */::error::/' || true
+          exit $rc
 
       - name: Keep the log
         if: always()
