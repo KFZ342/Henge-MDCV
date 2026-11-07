@@ -73,6 +73,14 @@ struct HomeView: View {
                     external.choose(url)
                 }
             }
+            .confirmationDialog("Which drive?", isPresented: $external.askingForVolume, titleVisibility: .visible) {
+                ForEach(external.detected) { volume in
+                    Button(volume.name) { external.use(volume) }
+                }
+                Button("Choose in Files instead…") { pickingDrive = true }
+            } message: {
+                Text("Henge found \(external.detected.count) volumes plugged in.")
+            }
             .task {
                 while !Task.isCancelled { // the region may be claimed after a hand-off to StikDebug
                     jitReady = JITBootstrap.ready
@@ -111,7 +119,7 @@ struct HomeView: View {
             NoticeRow(symbol: "externaldrive.fill", text: "Moving \(name)… keep Henge open")
         }
         if external.enabled, external.volumeName == nil {
-            DriveAwayRow(paused: external.paused, waiting: waiting, choose: { pickingDrive = true }, again: { external.reconnect() })
+            DriveAwayRow(paused: external.paused, waiting: waiting, choose: { external.pickDrive() }, again: { external.reconnect() })
         }
         if let error = machines.lastError {
             NoticeRow(symbol: "exclamationmark.triangle.fill", text: error, tint: Desk.bad,

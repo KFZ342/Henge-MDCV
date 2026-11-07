@@ -72,7 +72,7 @@ struct SettingsView: View {
                         Text("Download, install and run Macs on a drive plugged into this \(Device.name): their disks never take this device's space.")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
-                    Button(external.enabled ? "Choose a Different Drive…" : "Use External Storage…") { pickingDrive = true }
+                    Button(external.enabled ? "Choose a Different Drive…" : "Use External Storage…") { external.pickDrive() }
                     if external.enabled, external.volumeName != nil {
                         Button("Safely Disconnect") { external.eject() }
                     }
@@ -137,6 +137,14 @@ struct SettingsView: View {
                     pickingDrive = false
                     external.choose(url)
                 }
+            }
+            .confirmationDialog("Which drive?", isPresented: $external.askingForVolume, titleVisibility: .visible) {
+                ForEach(external.detected) { volume in
+                    Button(volume.name) { external.use(volume) }
+                }
+                Button("Choose in Files instead…") { pickingDrive = true }
+            } message: {
+                Text("Henge found \(external.detected.count) volumes plugged in.")
             }
             .confirmationDialog("Stop using external storage?", isPresented: $confirmTurnOff, titleVisibility: .visible) {
                 Button("Stop Using It", role: .destructive) { external.turnOff() }

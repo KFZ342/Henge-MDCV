@@ -36,13 +36,28 @@ final class ExternalStorage: ObservableObject {
     @Published private(set) var paused = false
     /// A drive that cannot keep holes pays for the whole 64 GB disk image: worth saying.
     @Published private(set) var supportsSparse = true
+    /// Drives found plugged in, when there is more than one to ask about.
+    @Published private(set) var detected: [VolumeCandidate] = []
+    /// A dialog is up asking which of them to use.
+    @Published var askingForVolume = false
+
+    /// A drive found without the Files picker: its volume root, and what it has room for.
+    struct VolumeCandidate: Identifiable, Hashable {
+        let url: URL
+        let name: String
+        let free: Int64?
+        var id: String { url.path }
+    }
 
     private let lock = NSLock()
     private var bookmark: Data?
+    private var plainPath: String?
     private var scopedFolder: URL?
     /// The drive's name as last seen, so it can be asked for by name while it is away.
     private var knownVolume: String?
     private let defaultsKey = "henge.external.folder"
+    /// A drive used without a bookmark: its path, found by looking at what is mounted.
+    private let pathKey = "henge.external.path"
     private let volumeKey = "henge.external.volume"
     private let knownKey = "henge.external.known"
 
@@ -76,8 +91,9 @@ final class ExternalStorage: ObservableObject {
 
     private init() {
         bookmark = UserDefaults.standard.data(forKey: defaultsKey)
+        plainPath = UserDefaults.standard.string(forKey: pathKey)
         knownVolume = UserDefaults.standard.string(forKey: volumeKey)
-        enabled = bookmark != nil
+        enabled = bookmark != nil || plainPath != nil
         known = Self.readKnown()
         resolve()
         watch()
@@ -122,6 +138,8 @@ final class ExternalStorage: ObservableObject {
             try? FileManager.default.removeItem(at: probe)
             let data = try url.bookmarkData() // iOS keeps the picker's grant to it in the bookmark
             UserDefaults.standard.set(data, forKey: defaultsKey)
+            UserDefaults.standard.removeObject(forKey: pathKey)
+            plainPath = nil
             bookmark = data
             enabled = true
             paused = false
@@ -132,6 +150,80 @@ final class ExternalStorage: ObservableObject {
         } catch {
             lastError = (error as NSError).localizedDescription
         }
+    }
+
+    // MARK: Finding a drive without the Files picker
+
+    /// Looks at what is mounted and uses the only drive there, or asks which one when
+    /// several are plugged in. iPadOS does not let a picker select the root of a volume,
+    /// which is what makes this the way a drive gets chosen when it is the only one in.
+    @MainActor func pickDrive() {
+        guard !Installer.shared.busy else {
+            lastError = "Wait for the install to finish before changing drives."
+            return
+        }
+        if let mac = runningOnDrive {
+            lastError = "Shut down \(mac.name) before changing the drive: its disk is on it and still being written."
+            return
+        }
+        detected = Self.scanVolumes()
+        if detected.isEmpty {
+            lastError = "No drive is plugged in. Plug it in, wait for the Files app to show it, then try again."
+            return
+        }
+        if detected.count == 1 { use(detected[0]) } else { askingForVolume = true }
+    }
+
+    /// Uses a drive found by scanning. Writing is probed first: a volume the app cannot
+    /// write to would otherwise fail hours into an install.
+    @MainActor func use(_ volume: VolumeCandidate) {
+        let url = volume.url
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        do {
+            let probe = url.appendingPathComponent(".henge-write-test")
+            try Data("x".utf8).write(to: probe)
+            try? FileManager.default.removeItem(at: probe)
+        } catch {
+            lastError = "iPadOS will not let Henge write to \(volume.name). Open it once in the Files app, then try again."
+            return
+        }
+        UserDefaults.standard.set(url.path, forKey: pathKey)
+        UserDefaults.standard.removeObject(forKey: defaultsKey)
+        bookmark = nil
+        plainPath = url.path
+        enabled = true
+        paused = false
+        lastError = nil
+        resolve()
+        HengeLog.log("external", "using the drive found at \(url.path)")
+    }
+
+    /// The volumes that could be a drive: not this device's own storage, not the system's.
+    static func scanVolumes() -> [VolumeCandidate] {
+        let keys: [URLResourceKey] = [.volumeNameKey, .volumeIsInternalKey, .volumeIsRemovableKey,
+                                      .volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey]
+        var urls: [URL] = []
+        if let mounted = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: keys, options: [.skipHiddenVolumes]) {
+            urls += mounted
+        }
+        // Volumes the system does not list there still have their folders here.
+        if let names = try? FileManager.default.contentsOfDirectory(atPath: "/Volumes") {
+            urls += names.map { URL(fileURLWithPath: "/Volumes", isDirectory: true).appendingPathComponent($0) }
+        }
+        var seen = Set<String>()
+        var found: [VolumeCandidate] = []
+        for url in urls {
+            let path = url.standardizedFileURL.path
+            guard seen.insert(path).inserted, path != "/", !path.hasPrefix("/private/var") else { continue }
+            let values = try? url.resourceValues(forKeys: keys)
+            if values?.volumeIsInternal == true, values?.volumeIsRemovable != true { continue }
+            var free: Int64?
+            if let important = values?.volumeAvailableCapacityForImportantUsage, important > 0 { free = Int64(important) }
+            else if let plain = values?.volumeAvailableCapacity, plain > 0 { free = Int64(plain) }
+            found.append(VolumeCandidate(url: url, name: values?.volumeName ?? url.lastPathComponent, free: free))
+        }
+        return found.sorted { $0.name < $1.name }
     }
 
     /// Stops using the drive. Macs on it stay there, waiting for it to be picked again.
@@ -145,7 +237,9 @@ final class ExternalStorage: ObservableObject {
             return
         }
         bookmark = nil
+        plainPath = nil
         UserDefaults.standard.removeObject(forKey: defaultsKey)
+        UserDefaults.standard.removeObject(forKey: pathKey)
         release()
         enabled = false
         paused = false
@@ -248,7 +342,20 @@ final class ExternalStorage: ObservableObject {
     /// Brings the bookmark back to a folder that can be used, or notes the drive is away.
     func resolve() {
         guard !paused else { return } // disconnected on purpose, until Reconnect
-        guard let data = bookmark else { return }
+        guard let data = bookmark else {
+            // A drive found by looking at what is mounted has no bookmark: its path is
+            // the grant the volume gives the app when it is plugged in.
+            guard let path = UserDefaults.standard.string(forKey: pathKey) else { return }
+            let url = URL(fileURLWithPath: path)
+            release()
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                volumeName = nil
+                freeBytes = nil
+                return
+            }
+            adopt(url)
+            return
+        }
         release() // the previous folder, whatever happens next
         var stale = false
         guard let url = try? URL(resolvingBookmarkData: data, options: [], relativeTo: nil, bookmarkDataIsStale: &stale) else {
@@ -274,6 +381,11 @@ final class ExternalStorage: ObservableObject {
             freeBytes = nil
             return
         }
+        adopt(url)
+    }
+
+    /// Holds the folder, and publishes what the volume is.
+    private func adopt(_ url: URL) {
         _ = url.startAccessingSecurityScopedResource() // held until the drive is changed or turned off
         lock.lock()
         scopedFolder = url
