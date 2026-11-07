@@ -201,8 +201,8 @@ final class ExternalStorage: ObservableObject {
 
     /// The volumes that could be a drive: not this device's own storage, not the system's.
     static func scanVolumes() -> [VolumeCandidate] {
-        let keys: Set<URLResourceKey> = [.volumeNameKey, .volumeIsInternalKey, .volumeIsRemovableKey,
-                                         .volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey]
+        let keys: [URLResourceKey] = [.volumeNameKey, .volumeIsInternalKey, .volumeIsRemovableKey,
+                                      .volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey]
         var urls: [URL] = []
         if let mounted = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: keys, options: [.skipHiddenVolumes]) {
             urls += mounted
@@ -216,7 +216,7 @@ final class ExternalStorage: ObservableObject {
         for url in urls {
             let path = url.standardizedFileURL.path
             guard seen.insert(path).inserted, path != "/", !path.hasPrefix("/private/var") else { continue }
-            let values = try? url.resourceValues(forKeys: keys)
+            let values = try? url.resourceValues(forKeys: Set(keys))
             if values?.volumeIsInternal == true, values?.volumeIsRemovable != true { continue }
             var free: Int64?
             if let important = values?.volumeAvailableCapacityForImportantUsage, important > 0 { free = Int64(important) }
